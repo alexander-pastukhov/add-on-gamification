@@ -1,0 +1,366 @@
+---
+title: "Gamification Analysis"
+author: "Alexander (Sasha) Pastukhov"
+date: "11 Juli 2018"
+output:
+  html_document:
+    highlight: tango
+    number_sections: yes
+    theme: united
+    toc: yes
+    toc_depth: 3
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list= ls())
+
+library('readr')
+library('dplyr')
+library('forcats')
+library('ggplot2')
+library('tibble')
+library('knitr')
+library('lme4')
+library('lmerTest')
+library('BayesFactor')
+library('tidyr')
+library('psycho')
+library('coin')
+library('car')
+library('lmPerm')
+```
+
+# Loading and preprocessing the data
+
+```{r Loading}
+results <- tibble(filename= list.files(path= 'Data', pattern = 'csv$')) %>%
+  rowwise() %>%
+  do(suppressMessages(read_csv2(file.path('Data', .)))) %>%
+
+  # converting selected variables to factors and using meaningful labels instead of boolean balues
+  ungroup() %>%
+  mutate(COA= as.factor(COA), 
+        Target= as.factor(Target), 
+        Condition= as.factor(Condition),
+        Observer= as.factor(Observer),
+        
+        Match= ifelse(Match == 'True', 'match', 'mismatch'), 
+        Response= ifelse(Response == 'True', 'match', 'mismatch'), 
+        Correct= Match == Response)
+
+# adding block index within the COA
+results <- results %>%
+  group_by(Observer, Condition, COA, Block) %>%
+  summarise() %>%
+  
+  group_by(Observer, Condition, COA) %>%
+  mutate(coaBlockIndex= 1:n()) %>%
+
+  right_join(results, by= c('Observer', 'Condition', 'COA', 'Block')) %>%
+
+    # retain only 12 blocks to facilitate comparison (some observers had more blocks)
+  filter(Block <= 12)
+```
+
+Computing score for each trial, including the _experiment_ condition group. Later, this would show whether having a maximal score in mind alters your behavior. For each trial the score is calculated as $$S(t)= Combo(t) \times \frac{ 10 \times (4-RT(t))}{3}$$/, where _RT(t)_ is the response time and _Combo(t)_ is a combo multiplier. The latter is increased by 1 after every correct answer but is reset to 1 after a mistake. 
+
+```{r Compute score}
+
+# computing time-based score, maximum is 10, but time penalty applies
+# this value will be translated into the real score later, based on combo and response
+results <- results %>%
+  # computing the time-based score the way it was done in the game
+  mutate(timebased_score= ceiling(10*((4-RT)/3))) %>%
+         
+  # clamping the score within 0..10 range, -1 means that the response was incorrect
+  mutate(timebased_score= ifelse(timebased_score>10, 10, timebased_score),
+         timebased_score= ifelse(timebased_score<0, 0, timebased_score), 
+         timebased_score= ifelse(!Correct, -1, timebased_score))
+         
+
+# computing combo-based score         
+compute_score_within_block <- function(timebased_score){
+  combo <- 1
+  score <- rep(NA, length(timebased_score))
+  for(iTrial in 1:length(timebased_score)){
+    if (timebased_score[iTrial]>=0){
+      score[iTrial] <- timebased_score[iTrial] * combo
+      combo <- combo + 1
+    }
+    else{
+      score[iTrial] <- 0
+      combo <- 1
+    }
+  }
+  
+  score
+}
+
+
+results <- results %>%
+  group_by(Observer, Condition, COA, Block) %>%
+  mutate(score= compute_score_within_block(timebased_score))
+
+rm('compute_score_within_block')
+```
+
+
+# Comparing two experimental groups to see if having add-on gamification changes behaviors
+
+## Effect of the cue-onset asynchrony (COA) and experimental condition on _performance_
+```{r COA on Performance}
+performance_coa <- results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  summarise(Performance= 100 * mean(Correct), 
+            logitPerformance= logit(Performance, percents = TRUE, adjust = 0.025))
+  
+# plot with SE as errorbars
+performance_plot <-performance_coa %>%
+  group_by(Condition, COA, coaBlockIndex) %>%
+  summarise(Performance_avg= mean(Performance), 
+            Performance_serr= sd(Performance)/sqrt(n()-1), 
+            Performance_lo= Performance_avg-Performance_serr, 
+            Performance_hi= Performance_avg+Performance_serr) %>%
+
+ggplot(aes(x= coaBlockIndex, y= Performance_avg, ymin= Performance_lo, ymax= Performance_hi,
+           color= Condition, linetype= Condition)) + 
+  geom_errorbar(width= 0.3, linetype= 'solid')+
+  geom_line() +
+  geom_point(aes(shape= Condition), size= 3) +
+  # geom_point(position = position_jitter(width= 0.2), color= 'black') +
+  facet_grid(.~COA) +
+  ylab('Performance [%]') +
+  xlab('Block index') +
+  theme(panel.grid.minor.x = element_blank(), legend.position = "none")
+
+print(performance_plot)
+```
+
+__Performance: Frequentist ANOVA__
+```{r COA on Performance - frequentist ANOVA}
+# frequentist ANOVA
+kable(summary(aov(logitPerformance ~ coaBlockIndex * COA * Condition, data= performance_coa))[[1]])
+```
+
+
+**Performance: Permutation ANOVA**
+```{r COA on Performance - permutation ANOVA}
+kable(summary(aovp(Performance ~ coaBlockIndex * COA * Condition, data= performance_coa))[[1]])
+```
+
+**Performance: Bayesian ANOVA**
+
+```{r COA on Performance - bayesian ANOVA}
+performance_coa %>%
+  ungroup() %>%
+  mutate(coaBlockIndex= as.factor(coaBlockIndex)) %>%
+  anovaBF(logitPerformance ~ coaBlockIndex * COA * Condition, data= .) %>% 
+  extractBF(.) %>%
+  select(-time, -code) %>%
+  kable(.)
+```
+
+```{r COA on Performance - clean up}
+rm(performance_coa, performance_plot)
+```
+
+## Effect of the cue-onset asynchrony (COA) and experimental condition on _response times_
+
+```{r COA on RT}
+RT_coa <- results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  summarise(RT= median(RT))
+
+# plot with SE as errorbars
+RT_plot <- RT_coa %>%
+  group_by(Condition, COA, coaBlockIndex) %>%
+  summarise(RT_avg= mean(RT), 
+            RT_serr= sd(RT)/sqrt(n()-1), 
+            RT_lo= RT_avg-RT_serr, 
+            RT_hi= RT_avg+RT_serr) %>%
+
+ ggplot(aes(x= coaBlockIndex, y= RT_avg, ymin= RT_lo, ymax= RT_hi,
+           color= Condition, linetype= Condition)) + 
+  geom_errorbar(width= 0.3)+
+  geom_line() +
+  geom_point(aes(shape= Condition), size= 3) +
+  # geom_point(position = position_jitter(width= 0.2), color= 'black') +
+  facet_grid(.~COA) +
+  ylab('Median RT [s]') +
+  xlab('Block index') +
+  theme(panel.grid.minor.x = element_blank(), legend.position = "none")
+
+print(RT_plot)
+
+# ggsave('Between-RT.pdf', RT_plot, path= 'Plots', width = 20, height = 20/1.5, units = 'cm', useDingbats= FALSE)
+```
+
+__RT: Frequentist ANOVA__
+```{r COA on RT - frequentist ANOVA}
+# frequentist ANOVA
+kable(summary(aov(RT ~ coaBlockIndex * COA * Condition, data= RT_coa))[[1]])
+```
+
+
+**RT: Permutation ANOVA**
+```{r COA on RT - permutation ANOVA}
+kable(summary(aovp(RT ~ coaBlockIndex * COA * Condition, data= RT_coa))[[1]])
+```
+
+**RT: Bayesian ANOVA**
+
+```{r COA on RT - bayesian ANOVA}
+RT_coa %>%
+  ungroup() %>%
+  mutate(coaBlockIndex= as.factor(coaBlockIndex)) %>%
+  anovaBF(RT ~ coaBlockIndex * COA * Condition, data= .) %>% 
+  extractBF(.) %>%
+  select(-time, -code) %>%
+  kable(.)
+```
+
+```{r COA on RT - clean up}
+rm(RT_coa, RT_plot)
+```
+
+## Effect of the cue-onset asynchrony (COA) and experimental condition on _total score_
+```{r COA on Score}
+score_coa <- results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  summarise(`Block Score`= sum(score))
+
+# plot with SE as errorbars
+score_plot <- score_coa %>%
+  group_by(Condition, COA, coaBlockIndex) %>%
+  summarise(Score_avg= mean(`Block Score`), 
+            Score_serr= sd(`Block Score`)/sqrt(n()-1), 
+            Score_lo= Score_avg-Score_serr, 
+            Score_hi= Score_avg+Score_serr) %>%
+
+ggplot(aes(x= coaBlockIndex, y= Score_avg, ymin= Score_lo, ymax= Score_hi,
+           color= Condition, linetype= Condition)) + 
+  geom_errorbar(width= 0.3)+
+  geom_line() +
+  geom_point(aes(shape= Condition), size= 3) +
+  # geom_point(position = position_jitter(width= 0.2), color= 'black') +
+  facet_grid(.~COA) +
+  ylab('Score [points]') +
+  xlab('Block index') + 
+  theme(panel.grid.minor.x = element_blank(), legend.position = "none")
+print(score_plot)
+# ggsave('Between-Score.pdf', score_plot, path= 'Plots', width = 20, height = 20/1.5, units = 'cm', useDingbats= FALSE)
+
+```
+
+
+**Score: Frequentist ANOVA**
+```{r COA on Score - frequentist ANOVA}
+# frequentist ANOVA
+# frequentist ANOVA
+kable(summary(aov(`Block Score` ~ coaBlockIndex * COA * Condition, data= score_coa))[[1]])
+```
+
+
+**Score: Permutation ANOVA**
+```{r COA on Score - permutation ANOVA}
+kable(summary(aovp(`Block Score` ~ coaBlockIndex * COA * Condition, data= score_coa))[[1]])
+```
+
+**Score: Bayesian ANOVA**
+
+```{r COA on Score - bayesian ANOVA}
+score_coa %>%
+  ungroup() %>%
+  mutate(coaBlockIndex= as.factor(coaBlockIndex)) %>%
+  anovaBF(`Block Score` ~ coaBlockIndex * COA * Condition, data= .) %>% 
+  extractBF(.) %>%
+  select(-time, -code) %>%
+  kable(.)
+```
+```{r COA on Score - cleanup}
+rm(score_coa, score_plot)
+```
+
+
+
+# Post-study questionnaires
+
+``` {r Load and preprocess questionnaires}
+questionnaire <- suppressMessages(read_csv2(file.path('Questionnaire', 'Questionnaire_ErsteTestung_ohneIFN_pressure invertiert_ohne pressure.csv'))) %>%
+  ungroup() %>%
+  mutate(Condition= as.factor(Condition))
+```
+
+## Gamer/Non-gamer
+
+This questionnaire is important to check the balance between the two experimental groups
+
+```{r Gamer}
+gamer <- questionnaire %>%
+  mutate(d_nonGamer= sqrt((GP01_01-2.58)^2+(GP02_01-1.61)^2+
+                     (GP02_02-1.88)^2+(GP02_03-4.3)^2+
+                     (GP02_04-1.49)^2+(GP02_05-2.69)^2+
+                     (GP02_06-2.20)^2+(GP02_07-2.59)^2+
+                     (GP02_08-4.68)^2+(GP02_09-2.20)^2)) %>%
+  select(Observer, Condition, d_nonGamer)
+
+oneway_test(d_nonGamer ~ Condition, gamer)
+
+
+gamer_plot <- gamer %>% ggplot(aes(x= Condition, y= d_nonGamer, color= Condition)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitter(height = 0, width = 0.2), color= 'black') + 
+  ylab("Distance to non-gamers' cluster") + 
+  theme(panel.grid.major.x = element_blank(), legend.position = "none")
+print(gamer_plot)
+
+# ggsave('Gaming habits.pdf', path= 'Plots', width = 12, height = 8, units = 'cm', useDingbats= FALSE)
+
+rm(gamer, gamer_plot)
+```
+
+## Intrinsic Motivation
+```{r IM}
+# computing subscales for the Intrinsic Motivation
+IM <- questionnaire %>%
+  mutate(enjoyment =  ((IM01_01 + IM01_05 + IM01_08 + IM01_10 + IM01_14 + IM01_17 + IM01_20)/7),
+         competence = ((IM01_04 + IM01_07 + IM01_12 + IM01_16 + IM01_22)/5),
+         choice = ((IM01_03 + IM01_11 + IM01_15 + IM01_19 + IM01_21)/5),
+         antipressure = ((IM01_02_i + IM01_06_i + IM01_09_i + IM01_13_i + IM01_18_i)/5)) %>%
+  
+  select(Observer, Condition, enjoyment, competence, choice, antipressure) %>%
+  gather(key= "Subscale", value = "Response", -Observer, -Condition)
+
+oneway_permutation_test <- function(subscaleDF){
+  test_results <- oneway_test(Response ~ Condition, data= subscaleDF)
+  
+  
+  tibble(Subscale= subscaleDF$Subscale[1], Z= statistic(test_results), pvalue= pvalue(test_results))
+}
+
+# Fisher-Pitman permutation test on each subscale, multiple comparions adjustment via Holm's method 
+IM %>% 
+  group_by(Subscale) %>%
+  do(oneway_permutation_test(.)) %>%
+  ungroup() %>%
+  mutate(`p(adjusted)`= p.adjust(pvalue, method = 'holm')) %>%
+  kable(.)
+
+
+IM_plot <- IM %>% ggplot(aes(x= Condition, y= Response, color= Condition)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_jitter(height = 0, width = 0.2), color= 'black') + 
+  facet_grid(. ~ Subscale) + 
+  theme(panel.grid.major.x = element_blank(), legend.position = "none")
+
+print(IM_plot)
+
+# ggsave('IM.pdf', IM_plot, path= 'Plots', width = 24, height = 16, units = 'cm', useDingbats= FALSE)
+
+rm('oneway_permutation_test', IM, IM_plot)
+```
