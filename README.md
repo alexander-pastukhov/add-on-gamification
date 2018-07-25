@@ -1,5 +1,5 @@
 # Add-on Gamification
-Data and analysis for the "Add-on Gamification" manuscript and conference poster.
+Data and analysis for the "Add-on Gamification" manuscript and conference poster. Please use **Gamification Analysis.Rmd** to replicate the analysis and **Gamification Analysis.md** to view the results online.
 
 ## Data
 
