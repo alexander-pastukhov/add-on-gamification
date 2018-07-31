@@ -3,15 +3,19 @@ title: "Gamification Analysis"
 author: "Alexander (Sasha) Pastukhov"
 date: "11 Juli 2018"
 output:
+  github_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
   html_document:
+    keep_md: true
     highlight: tango
     number_sections: yes
     theme: united
     toc: yes
     toc_depth: 3
-  pdf_document:
-    toc: yes
-    toc_depth: '3'
 ---
 
 ```{r setup, include=FALSE}
@@ -291,9 +295,10 @@ rm(score_coa, score_plot)
 # Post-study questionnaires
 
 ``` {r Load and preprocess questionnaires}
-questionnaire <- suppressMessages(read_csv2(file.path('Questionnaire', 'Questionnaire_ErsteTestung_ohneIFN_pressure invertiert_ohne pressure.csv'))) %>%
+questionnaire <- suppressMessages(read_csv2(file.path('Questionnaire', 'Questionnaire_ErsteTestung_ohneIFN.csv'))) %>%
   ungroup() %>%
-  mutate(Condition= as.factor(Condition))
+  mutate(Condition= as.factor(Condition), 
+         Condition= fct_relevel(Condition, 'game'))
 ```
 
 ## Gamer/Non-gamer
@@ -331,9 +336,9 @@ IM <- questionnaire %>%
   mutate(enjoyment =  ((IM01_01 + IM01_05 + IM01_08 + IM01_10 + IM01_14 + IM01_17 + IM01_20)/7),
          competence = ((IM01_04 + IM01_07 + IM01_12 + IM01_16 + IM01_22)/5),
          choice = ((IM01_03 + IM01_11 + IM01_15 + IM01_19 + IM01_21)/5),
-         antipressure = ((IM01_02_i + IM01_06_i + IM01_09_i + IM01_13_i + IM01_18_i)/5)) %>%
+         pressure =((IM01_02 + IM01_06 + IM01_09 + IM01_13 + IM01_18)/5)) %>%
   
-  select(Observer, Condition, enjoyment, competence, choice, antipressure) %>%
+  select(Observer, Condition, enjoyment, competence, choice, pressure) %>%
   gather(key= "Subscale", value = "Response", -Observer, -Condition)
 
 oneway_permutation_test <- function(subscaleDF){
