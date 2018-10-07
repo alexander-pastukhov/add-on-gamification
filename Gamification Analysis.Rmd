@@ -20,14 +20,10 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+```
 
-rm(list= ls())
-
-library('readr')
-library('dplyr')
-library('forcats')
-library('ggplot2')
-library('tibble')
+```{r libraries}
+library('tidyverse')
 library('knitr')
 library('lme4')
 library('lmerTest')
@@ -42,6 +38,8 @@ library('lmPerm')
 # Loading and preprocessing the data
 
 ```{r Loading}
+rm(list= ls())
+
 results <- tibble(filename= list.files(path= 'Data', pattern = 'csv$')) %>%
   rowwise() %>%
   do(suppressMessages(read_csv2(file.path('Data', .)))) %>%
