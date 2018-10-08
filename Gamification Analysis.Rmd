@@ -33,6 +33,7 @@ library('psycho')
 library('coin')
 library('car')
 library('lmPerm')
+library('boot')
 ```
 
 # Loading and preprocessing the data
@@ -116,6 +117,29 @@ rm('compute_score_within_block')
 
 ## Effect of the cue-onset asynchrony (COA) and experimental condition on _performance_
 ```{r COA on Performance}
+boot_results <- results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  mutate(iTrial= 1:n())
+
+
+meanFn <- function(data, index){
+  mean(data[index], na.rm= TRUE)
+} 
+
+bootObserverAverage <- function(values){
+  observerAverage= boot(data= values, statistic = meanFn, R= 1000)
+  data.frame(Average=observerAverage$t[, 1])
+}
+
+bootGroupMean <- boot_results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  do(bootObserverPerformance(.$Correct))
+
+groupCI <- boot(data= seq(1, max(boot_results$iTrial)), statistic= computeGroupMean, R= 1000)
+
+boot.ci(groupCI, conf = 0.95, type = "bca")
+
+
 performance_coa <- results %>%
   group_by(Observer, Condition, COA, coaBlockIndex) %>%
   summarise(Performance= 100 * mean(Correct), 
