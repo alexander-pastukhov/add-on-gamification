@@ -236,17 +236,28 @@ rm(groupPerformance, performance_coa)
 
 ## Effect of the cue-onset asynchrony (COA) and experimental condition on _response times_
 
-```{r, group RT}
-# plot with SE as errorbars
-RT_plot <- RT_coa %>%
+```{r, group RT, cache= TRUE}
+groupMedianRT <- results %>%
   group_by(Condition, COA, coaBlockIndex) %>%
-  summarise(RT_avg= mean(RT), 
-            RT_serr= sd(RT)/sqrt(n()-1), 
-            RT_lo= RT_avg-RT_serr, 
-            RT_hi= RT_avg+RT_serr) %>%
+  do(getvariableCI(data= ., variableOfInterest = 'RT', seed = 1538988495, avgFun = median))
 
- ggplot(aes(x= coaBlockIndex, y= RT_avg, ymin= RT_lo, ymax= RT_hi,
+
+ggplot(data= groupMedianRT, 
+       aes(x= coaBlockIndex, y= meanValue, ymin= bcaLower, ymax= bcaUpper,
            color= Condition, linetype= Condition)) + 
+  geom_errorbar(width= 0.3, linetype= 'solid')+
+  geom_line() +
+  geom_point(aes(shape= Condition), size= 3) +
+  # geom_point(position = position_jitter(width= 0.2), color= 'black') +
+  facet_grid(.~COA) +
+  ylab('Median RT [s]') +
+  xlab('Block index') +
+  theme(panel.grid.minor.x = element_blank(), legend.position = "none")
+
+
+ggplot(data= groupMedianRT, 
+      aes(x= coaBlockIndex, y= RT_avg, ymin= RT_lo, ymax= RT_hi,
+         color= Condition, linetype= Condition)) + 
   geom_errorbar(width= 0.3)+
   geom_line() +
   geom_point(aes(shape= Condition), size= 3) +
