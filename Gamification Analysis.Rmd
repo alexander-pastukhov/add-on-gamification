@@ -22,13 +22,12 @@ output:
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-```{r libraries, warning=FALSE}
+```{r libraries, message=FALSE, warning=FALSE}
 library('tidyverse')
 library('knitr')
 library('lme4')
 library('lmerTest')
 library('BayesFactor')
-library('tidyr')
 library('psycho')
 library('coin')
 library('car')
@@ -116,44 +115,81 @@ rm('compute_score_within_block')
 # Comparing two experimental groups to see if having add-on gamification changes behaviors
 
 ## Effect of the cue-onset asynchrony (COA) and experimental condition on _performance_
-```{r COA on Performance}
-boot_results <- results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
-  mutate(iTrial= 1:n())
-
-
-meanFn <- function(data, index){
-  mean(data[index], na.rm= TRUE)
-} 
-
-bootObserverAverage <- function(values){
-  observerAverage= boot(data= values, statistic = meanFn, R= 1000)
-  data.frame(Average=observerAverage$t[, 1])
+```{r Function to bootstrap CI for group means}
+#' Computes mean value for the sample
+#'
+#' @description Computes mean value for the \code{variableOfInterest} using a sample of row, 
+#'  defined by \code{bootstrapIndex}, from the \code{variableOfInterest}. 
+#' @param irrelevantData fake data supplied to \code{boot} function those length is equal to the total 
+#' number of rows for a single observer 
+#' @param bootstrapIndex index of rows supplied by \code{boot} function.
+#' @param dfOfInterest table with actual group data
+#' @param variableOfInterest name of the column that must be sampled
+#' @param avgFun function used for computing average value
+#'
+#' @return sampled group mean 
+getVariableSampleMean <- function(irrelevantData, bootstrapIndex, dfOfInterest, variableOfInterest, avgFun){
+  dfOfInterest %>%
+    # first sampling each observer the same way and computing their averages
+    group_by(Observer) %>%
+    slice(bootstrapIndex) %>%
+    summarise(varMean= avgFun(!!as.name(variableOfInterest), na.rm= TRUE)) %>%
+  
+    # then, the group average
+    ungroup() %>%
+    summarise(varMean= mean(varMean)) %>%
+    
+    # returning only the group mean
+    pull(varMean)
 }
 
-bootGroupMean <- boot_results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
-  do(bootObserverPerformance(.$Correct))
-
-groupCI <- boot(data= seq(1, max(boot_results$iTrial)), statistic= computeGroupMean, R= 1000)
-
-boot.ci(groupCI, conf = 0.95, type = "bca")
-
-
-performance_coa <- results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
-  summarise(Performance= 100 * mean(Correct), 
-            logitPerformance= logit(Performance, percents = TRUE, adjust = 0.025))
+#' Computes variable mean and 95% bootstrapped bca CI 
+#'
+#' @param data data table
+#' @param variableOfInterest name of the column to analyze
+#' @param seed seed for the random numbers generator (to make CIs reproducable). NULL means no seeding
+#' @param avgFun function used for computing average value, defaults to 'mean'
+#' @param R number of bootstrap iterations, defaults to 2000
+#'
+#' @return table with columns bcaLower, meanValue, bcaUpper
+getvariableCI <- function(data, variableOfInterest, seed= NULL, avgFun= mean, R= 2000){
+  # figuring out number of trials per observer
+  trialN <- data %>%
+    group_by(Observer) %>%
+    summarise(trialCount= n()) %>%
+    pull(trialCount)
   
-# plot with SE as errorbars
-performance_plot <-performance_coa %>%
-  group_by(Condition, COA, coaBlockIndex) %>%
-  summarise(Performance_avg= mean(Performance), 
-            Performance_serr= sd(Performance)/sqrt(n()-1), 
-            Performance_lo= Performance_avg-Performance_serr, 
-            Performance_hi= Performance_avg+Performance_serr) %>%
+  # seeding the random numbers generator
+  if (!is.null(seed)){
+    set.seed(seed)
+  }
+  
+  # sample mean
+  sampledMean <-boot(data= 1:max(trialN), 
+                     statistic = getVariableSampleMean, R= R, 
+                     dfOfInterest= data, 
+                     variableOfInterest= variableOfInterest, 
+                     avgFun= avgFun)
+  
+  # compute CIs
+  sampledCI <- boot.ci(boot.out= sampledMean, type= 'bca')
+  
+  # compute mean over ALL the data
+  meanValue <- getVariableSampleMean(NULL, 1:max(trialN), data, variableOfInterest, avgFun)
+  
+  # package for output
+  data.frame(bcaLower= sampledCI$bca[4], meanValue= meanValue, bcaUpper= sampledCI$bca[5])
+}
+```
 
-ggplot(aes(x= coaBlockIndex, y= Performance_avg, ymin= Performance_lo, ymax= Performance_hi,
+
+```{r, Group Performance, cache=TRUE}
+groupPerformance <- results %>%
+  group_by(Condition, COA, coaBlockIndex) %>%
+  do(getvariableCI(data= ., variableOfInterest = 'Correct', seed = 1538985527))
+
+ggplot(data= groupPerformance, 
+       aes(x= coaBlockIndex, y= meanValue, ymin= bcaLower, ymax= bcaUpper,
            color= Condition, linetype= Condition)) + 
   geom_errorbar(width= 0.3, linetype= 'solid')+
   geom_line() +
@@ -163,25 +199,28 @@ ggplot(aes(x= coaBlockIndex, y= Performance_avg, ymin= Performance_lo, ymax= Per
   ylab('Performance [%]') +
   xlab('Block index') +
   theme(panel.grid.minor.x = element_blank(), legend.position = "none")
-
-print(performance_plot)
 ```
 
 __Performance: Frequentist ANOVA__
-```{r COA on Performance - frequentist ANOVA}
+```{r, Performance - frequentist ANOVA}
+performance_coa <- results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  summarise(Performance= 100 * mean(Correct), 
+            logitPerformance= car::logit(Performance, percents = TRUE, adjust = 0.025))
+
 # frequentist ANOVA
 kable(summary(aov(logitPerformance ~ coaBlockIndex * COA * Condition, data= performance_coa))[[1]])
 ```
 
 
 **Performance: Permutation ANOVA**
-```{r COA on Performance - permutation ANOVA}
+```{r, Performance - permutation ANOVA}
 kable(summary(aovp(Performance ~ coaBlockIndex * COA * Condition, data= performance_coa))[[1]])
 ```
 
 **Performance: Bayesian ANOVA**
 
-```{r COA on Performance - bayesian ANOVA}
+```{r, Performance - bayesian ANOVA}
 performance_coa %>%
   ungroup() %>%
   mutate(coaBlockIndex= as.factor(coaBlockIndex)) %>%
@@ -191,17 +230,13 @@ performance_coa %>%
   kable(.)
 ```
 
-```{r COA on Performance - clean up}
-rm(performance_coa, performance_plot)
+```{r, Performance - clean up}
+rm(groupPerformance, performance_coa)
 ```
 
 ## Effect of the cue-onset asynchrony (COA) and experimental condition on _response times_
 
-```{r COA on RT}
-RT_coa <- results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
-  summarise(RT= median(RT))
-
+```{r, group RT}
 # plot with SE as errorbars
 RT_plot <- RT_coa %>%
   group_by(Condition, COA, coaBlockIndex) %>%
@@ -227,8 +262,13 @@ print(RT_plot)
 ```
 
 __RT: Frequentist ANOVA__
-```{r COA on RT - frequentist ANOVA}
+```{r, RT - frequentist ANOVA}
 # frequentist ANOVA
+
+RT_coa <- results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  summarise(RT= median(RT))
+
 kable(summary(aov(RT ~ coaBlockIndex * COA * Condition, data= RT_coa))[[1]])
 ```
 
