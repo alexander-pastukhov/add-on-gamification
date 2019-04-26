@@ -1,13 +1,40 @@
-Gamification Analysis
-================
-Alexander (Sasha) Pastukhov
-11 Juli 2018
+---
+title: "Gamification Analysis"
+author: "Alexander (Sasha) Pastukhov"
+date: "11 Juli 2018"
+output:
+  html_document:
+    keep_md: true
+    highlight: tango
+    theme: united
+  pdf_document: default
+  github_document: default
+---
+
+
+
+
+```r
+library('tidyverse')
+library('knitr')
+library('lme4')
+library('lmerTest')
+library('BayesFactor')
+library('psycho')
+library('coin')
+library('car')
+library('lmPerm')
+library('boot')
+```
 
 # Loading and preprocessing the data
 
-``` r
+
+```r
+rm(list= ls())
+
 results <- tibble(filename= list.files(path= 'Data', pattern = 'csv$')) %>%
-  rowwise() %>%
+  group_by(filename) %>%
   do(suppressMessages(read_csv2(file.path('Data', .)))) %>%
 
   # converting selected variables to factors and using meaningful labels instead of boolean balues
@@ -35,15 +62,10 @@ results <- results %>%
   filter(Block <= 12)
 ```
 
-Computing score for each trial, including the *experiment* condition
-group. Later, this would show whether having a maximal score in mind
-alters your behavior. For each trial the score is calculated as
-\[S(t)= Combo(t) \times \frac{ 10 \times (4-RT(t))}{3}\]/, where *RT(t)*
-is the response time and *Combo(t)* is a combo multiplier. The latter is
-increased by 1 after every correct answer but is reset to 1 after a
-mistake.
+Computing score for each trial, including the _experiment_ condition group. Later, this would show whether having a maximal score in mind alters your behavior. For each trial the score is calculated as $$S(t)= Combo(t) \times \frac{ 10 \times (4-RT(t))}{3}$$/, where _RT(t)_ is the response time and _Combo(t)_ is a combo multiplier. The latter is increased by 1 after every correct answer but is reset to 1 after a mistake. 
 
-``` r
+
+```r
 # computing time-based score, maximum is 10, but time penalty applies
 # this value will be translated into the real score later, based on combo and response
 results <- results %>%
@@ -82,25 +104,87 @@ results <- results %>%
 rm('compute_score_within_block')
 ```
 
+
 # Comparing two experimental groups to see if having add-on gamification changes behaviors
 
-## Effect of the cue-onset asynchrony (COA) and experimental condition on *performance*
+## Effect of the cue-onset asynchrony (COA) and experimental condition on _performance_
 
-``` r
-performance_coa <- results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
-  summarise(Performance= 100 * mean(Correct), 
-            logitPerformance= logit(Performance, percents = TRUE, adjust = 0.025))
+```r
+#' Computes mean value for the sample
+#'
+#' @description Computes mean value for the \code{variableOfInterest} using a sample of row, 
+#'  defined by \code{bootstrapIndex}, from the \code{variableOfInterest}. 
+#' @param irrelevantData fake data supplied to \code{boot} function those length is equal to the total 
+#' number of rows for a single observer 
+#' @param bootstrapIndex index of rows supplied by \code{boot} function.
+#' @param dfOfInterest table with actual group data
+#' @param variableOfInterest name of the column that must be sampled
+#' @param avgFun function used for computing average value
+#'
+#' @return sampled group mean 
+getVariableSampleMean <- function(irrelevantData, bootstrapIndex, dfOfInterest, variableOfInterest, avgFun){
+  dfOfInterest %>%
+    # first sampling each observer the same way and computing their averages
+    group_by(Observer) %>%
+    slice(bootstrapIndex) %>%
+    summarise(varMean= avgFun(!!as.name(variableOfInterest), na.rm= TRUE)) %>%
   
-# plot with SE as errorbars
-performance_plot <-performance_coa %>%
-  group_by(Condition, COA, coaBlockIndex) %>%
-  summarise(Performance_avg= mean(Performance), 
-            Performance_serr= sd(Performance)/sqrt(n()-1), 
-            Performance_lo= Performance_avg-Performance_serr, 
-            Performance_hi= Performance_avg+Performance_serr) %>%
+    # then, the group average
+    ungroup() %>%
+    summarise(varMean= mean(varMean)) %>%
+    
+    # returning only the group mean
+    pull(varMean)
+}
 
-ggplot(aes(x= coaBlockIndex, y= Performance_avg, ymin= Performance_lo, ymax= Performance_hi,
+#' Computes variable mean and 95% bootstrapped bca CI 
+#'
+#' @param data data table
+#' @param variableOfInterest name of the column to analyze
+#' @param seed seed for the random numbers generator (to make CIs reproducable). NULL means no seeding
+#' @param avgFun function used for computing average value, defaults to 'mean'
+#' @param R number of bootstrap iterations, defaults to 2000
+#'
+#' @return table with columns bcaLower, meanValue, bcaUpper
+getvariableCI <- function(data, variableOfInterest, seed= NULL, avgFun= mean, R= 2000){
+  # figuring out number of trials per observer
+  trialN <- data %>%
+    group_by(Observer) %>%
+    summarise(trialCount= n()) %>%
+    pull(trialCount)
+  
+  # seeding the random numbers generator
+  if (!is.null(seed)){
+    set.seed(seed)
+  }
+  
+  # sample mean
+  sampledMean <-boot(data= 1:max(trialN), 
+                     statistic = getVariableSampleMean, R= R, 
+                     dfOfInterest= data, 
+                     variableOfInterest= variableOfInterest, 
+                     avgFun= avgFun)
+  
+  # compute CIs
+  sampledCI <- boot.ci(boot.out= sampledMean, type= 'bca')
+  
+  # compute mean over ALL the data
+  meanValue <- getVariableSampleMean(NULL, 1:max(trialN), data, variableOfInterest, avgFun)
+  
+  # package for output
+  data.frame(bcaLower= sampledCI$bca[4], meanValue= meanValue, bcaUpper= sampledCI$bca[5])
+}
+```
+
+
+
+```r
+groupPerformance <- results %>%
+  group_by(Condition, COA, coaBlockIndex) %>%
+  do(getvariableCI(data= ., variableOfInterest = 'Correct', seed = 1538985527))
+
+ggplot(data= groupPerformance, 
+       aes(x= coaBlockIndex, y= meanValue, ymin= bcaLower, ymax= bcaUpper,
            color= Condition, linetype= Condition)) + 
   geom_errorbar(width= 0.3, linetype= 'solid')+
   geom_line() +
@@ -110,53 +194,59 @@ ggplot(aes(x= coaBlockIndex, y= Performance_avg, ymin= Performance_lo, ymax= Per
   ylab('Performance [%]') +
   xlab('Block index') +
   theme(panel.grid.minor.x = element_blank(), legend.position = "none")
-
-print(performance_plot)
 ```
 
-![](Gamification_Analysis_files/figure-gfm/COA%20on%20Performance-1.png)<!-- -->
+![](Gamification_Analysis_files/figure-html/Group Performance-1.png)<!-- -->
 
-**Performance: Frequentist ANOVA**
+__Performance: Frequentist ANOVA__
 
-``` r
+```r
+performance_coa <- results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  summarise(Performance= 100 * mean(Correct), 
+            logitPerformance= car::logit(Performance, percents = TRUE, adjust = 0.025))
+
 # frequentist ANOVA
 kable(summary(aov(logitPerformance ~ coaBlockIndex * COA * Condition, data= performance_coa))[[1]])
 ```
 
-|                             |  Df |      Sum Sq |    Mean Sq |    F value |   Pr(\>F) |
-| --------------------------- | --: | ----------: | ---------: | ---------: | --------: |
-| coaBlockIndex               |   1 |  11.1344593 | 11.1344593 | 18.7791985 | 0.0000196 |
-| COA                         |   2 |   7.0831621 |  3.5415811 |  5.9731732 | 0.0028351 |
-| Condition                   |   1 |   4.8921520 |  4.8921520 |  8.2510243 | 0.0043415 |
-| coaBlockIndex:COA           |   2 |   2.6884010 |  1.3442005 |  2.2671068 | 0.1052528 |
-| coaBlockIndex:Condition     |   1 |   0.3457168 |  0.3457168 |  0.5830803 | 0.4456631 |
-| COA:Condition               |   2 |   0.3379669 |  0.1689834 |  0.2850047 | 0.7521990 |
-| coaBlockIndex:COA:Condition |   2 |   0.0225065 |  0.0112532 |  0.0189795 | 0.9812006 |
-| Residuals                   | 324 | 192.1043018 |  0.5929145 |         NA |        NA |
+                                Df        Sum Sq      Mean Sq      F value      Pr(>F)
+----------------------------  ----  ------------  -----------  -----------  ----------
+coaBlockIndex                    1    11.1344593   11.1344593   18.7791985   0.0000196
+COA                              2     7.0831621    3.5415811    5.9731732   0.0028351
+Condition                        1     4.8921520    4.8921520    8.2510243   0.0043415
+coaBlockIndex:COA                2     2.6884010    1.3442005    2.2671068   0.1052528
+coaBlockIndex:Condition          1     0.3457168    0.3457168    0.5830803   0.4456631
+COA:Condition                    2     0.3379669    0.1689834    0.2850047   0.7521990
+coaBlockIndex:COA:Condition      2     0.0225065    0.0112532    0.0189795   0.9812006
+Residuals                      324   192.1043018    0.5929145           NA          NA
 
-**Performance: Permutation
-ANOVA**
 
-``` r
+**Performance: Permutation ANOVA**
+
+```r
 kable(summary(aovp(Performance ~ coaBlockIndex * COA * Condition, data= performance_coa))[[1]])
 ```
 
-    ## [1] "Settings:  unique SS : numeric variables centered"
+```
+## [1] "Settings:  unique SS : numeric variables centered"
+```
 
-|                             |  Df |    R Sum Sq |  R Mean Sq | Iter |  Pr(Prob) |
-| --------------------------- | --: | ----------: | ---------: | ---: | --------: |
-| coaBlockIndex               |   1 |  2568.02094 | 2568.02094 | 5000 | 0.0000000 |
-| COA                         |   2 |  1589.65257 |  794.82629 | 5000 | 0.0000000 |
-| coaBlockIndex:COA           |   2 |   519.62942 |  259.81471 | 1503 | 0.0864937 |
-| Condition                   |   1 |  1683.42066 | 1683.42066 | 5000 | 0.0000000 |
-| coaBlockIndex:Condition     |   1 |    98.23754 |   98.23754 |   51 | 1.0000000 |
-| COA:Condition               |   2 |    70.55535 |   35.27767 |   51 | 1.0000000 |
-| coaBlockIndex:COA:Condition |   2 |    28.10330 |   14.05165 |   51 | 1.0000000 |
-| Residuals                   | 324 | 47903.86285 |  147.85143 |   NA |        NA |
+                                Df      R Sum Sq    R Mean Sq   Iter    Pr(Prob)
+----------------------------  ----  ------------  -----------  -----  ----------
+coaBlockIndex                    1    2568.02094   2568.02094   5000   0.0000000
+COA                              2    1589.65257    794.82629   5000   0.0072000
+coaBlockIndex:COA                2     519.62942    259.81471   1880   0.1765957
+Condition                        1    1683.42066   1683.42066   5000   0.0000000
+coaBlockIndex:Condition          1      98.23754     98.23754     51   0.8235294
+COA:Condition                    2      70.55535     35.27767    143   0.5804196
+coaBlockIndex:COA:Condition      2      28.10330     14.05165     51   0.7450980
+Residuals                      324   47903.86285    147.85143     NA          NA
 
 **Performance: Bayesian ANOVA**
 
-``` r
+
+```r
 performance_coa %>%
   ungroup() %>%
   mutate(coaBlockIndex= as.factor(coaBlockIndex)) %>%
@@ -166,51 +256,49 @@ performance_coa %>%
   kable(.)
 ```
 
-    ## Warning: data coerced from tibble to data frame
-
-|                                                                                                                             |           bf |     error |
-| --------------------------------------------------------------------------------------------------------------------------- | -----------: | --------: |
-| Condition                                                                                                                   |    4.5749029 | 0.0000000 |
-| COA                                                                                                                         |    5.2346402 | 0.0000749 |
-| Condition + COA                                                                                                             |   26.5102198 | 0.0275938 |
-| Condition + COA + Condition:COA                                                                                             |    1.9471992 | 0.0215222 |
-| coaBlockIndex                                                                                                               |  189.2595007 | 0.0000848 |
-| Condition + coaBlockIndex                                                                                                   | 1062.7831853 | 0.0228747 |
-| COA + coaBlockIndex                                                                                                         | 1341.2630401 | 0.0089592 |
-| Condition + COA + coaBlockIndex                                                                                             | 8770.7716818 | 0.0208540 |
-| Condition + COA + Condition:COA + coaBlockIndex                                                                             |  829.6727385 | 0.1919701 |
-| Condition + coaBlockIndex + Condition:coaBlockIndex                                                                         |   70.1548702 | 0.0151655 |
-| Condition + COA + coaBlockIndex + Condition:coaBlockIndex                                                                   |  602.5383745 | 0.0364390 |
-| Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex                                                   |   43.7566423 | 0.0232401 |
-| COA + coaBlockIndex + COA:coaBlockIndex                                                                                     |  100.3171100 | 0.0107210 |
-| Condition + COA + coaBlockIndex + COA:coaBlockIndex                                                                         |  680.5419572 | 0.0157927 |
-| Condition + COA + Condition:COA + coaBlockIndex + COA:coaBlockIndex                                                         |   54.1677112 | 0.0312733 |
-| Condition + COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                                               |   47.0454599 | 0.0288672 |
-| Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                               |    3.5985018 | 0.0217499 |
-| Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex + Condition:COA:coaBlockIndex |    0.1415888 | 0.0215311 |
-
-``` r
-rm(performance_coa, performance_plot)
+```
+## Warning: data coerced from tibble to data frame
 ```
 
-## Effect of the cue-onset asynchrony (COA) and experimental condition on *response times*
+                                                                                                                                         bf       error
+----------------------------------------------------------------------------------------------------------------------------  -------------  ----------
+Condition                                                                                                                         4.5749029   0.0000000
+COA                                                                                                                               5.2346402   0.0000749
+Condition + COA                                                                                                                  26.6702397   0.0127398
+Condition + COA + Condition:COA                                                                                                   1.9887021   0.0204531
+coaBlockIndex                                                                                                                   189.2595007   0.0000848
+Condition + coaBlockIndex                                                                                                      1059.9886631   0.0147141
+COA + coaBlockIndex                                                                                                            1361.3714977   0.0163593
+Condition + COA + coaBlockIndex                                                                                                8449.5350296   0.0142830
+Condition + COA + Condition:COA + coaBlockIndex                                                                                 653.9757839   0.0181766
+Condition + coaBlockIndex + Condition:coaBlockIndex                                                                              71.5257383   0.0214370
+Condition + COA + coaBlockIndex + Condition:coaBlockIndex                                                                       617.6274110   0.0364090
+Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex                                                        45.9000416   0.0384412
+COA + coaBlockIndex + COA:coaBlockIndex                                                                                         101.0679101   0.0121088
+Condition + COA + coaBlockIndex + COA:coaBlockIndex                                                                             695.6844693   0.0216234
+Condition + COA + Condition:COA + coaBlockIndex + COA:coaBlockIndex                                                              53.8234651   0.0398021
+Condition + COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                                                    47.7663333   0.0275887
+Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                                     3.5885181   0.0243076
+Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex + Condition:COA:coaBlockIndex       0.1439643   0.0239429
 
-``` r
-RT_coa <- results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
-  summarise(RT= median(RT))
 
-# plot with SE as errorbars
-RT_plot <- RT_coa %>%
+```r
+rm(groupPerformance, performance_coa)
+```
+
+## Effect of the cue-onset asynchrony (COA) and experimental condition on _response times_
+
+
+```r
+groupMedianRT <- results %>%
   group_by(Condition, COA, coaBlockIndex) %>%
-  summarise(RT_avg= mean(RT), 
-            RT_serr= sd(RT)/sqrt(n()-1), 
-            RT_lo= RT_avg-RT_serr, 
-            RT_hi= RT_avg+RT_serr) %>%
+  do(getvariableCI(data= ., variableOfInterest = 'RT', seed = 1538988495, avgFun = median))
 
- ggplot(aes(x= coaBlockIndex, y= RT_avg, ymin= RT_lo, ymax= RT_hi,
+
+ggplot(data= groupMedianRT, 
+       aes(x= coaBlockIndex, y= meanValue, ymin= bcaLower, ymax= bcaUpper,
            color= Condition, linetype= Condition)) + 
-  geom_errorbar(width= 0.3)+
+  geom_errorbar(width= 0.3, linetype= 'solid')+
   geom_line() +
   geom_point(aes(shape= Condition), size= 3) +
   # geom_point(position = position_jitter(width= 0.2), color= 'black') +
@@ -218,57 +306,63 @@ RT_plot <- RT_coa %>%
   ylab('Median RT [s]') +
   xlab('Block index') +
   theme(panel.grid.minor.x = element_blank(), legend.position = "none")
-
-print(RT_plot)
 ```
 
-![](Gamification_Analysis_files/figure-gfm/COA%20on%20RT-1.png)<!-- -->
+![](Gamification_Analysis_files/figure-html/group RT-1.png)<!-- -->
 
-``` r
+```r
 # ggsave('Between-RT.pdf', RT_plot, path= 'Plots', width = 20, height = 20/1.5, units = 'cm', useDingbats= FALSE)
 ```
 
-**RT: Frequentist ANOVA**
+__RT: Frequentist ANOVA__
 
-``` r
+```r
 # frequentist ANOVA
+
+RT_coa <- results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  summarise(RT= median(RT))
+
 kable(summary(aov(RT ~ coaBlockIndex * COA * Condition, data= RT_coa))[[1]])
 ```
 
-|                             |  Df |      Sum Sq |   Mean Sq |    F value |   Pr(\>F) |
-| --------------------------- | --: | ----------: | --------: | ---------: | --------: |
-| coaBlockIndex               |   1 |   8.5593621 | 8.5593621 | 16.9380538 | 0.0000490 |
-| COA                         |   2 |   0.0060435 | 0.0030217 |  0.0059797 | 0.9940382 |
-| Condition                   |   1 |   3.4040437 | 3.4040437 |  6.7362351 | 0.0098773 |
-| coaBlockIndex:COA           |   2 |   0.0254060 | 0.0127030 |  0.0251379 | 0.9751773 |
-| coaBlockIndex:Condition     |   1 |   0.0010744 | 0.0010744 |  0.0021261 | 0.9632511 |
-| COA:Condition               |   2 |   0.0053423 | 0.0026712 |  0.0052859 | 0.9947281 |
-| coaBlockIndex:COA:Condition |   2 |   0.5221628 | 0.2610814 |  0.5166519 | 0.5970050 |
-| Residuals                   | 324 | 163.7279790 | 0.5053333 |         NA |        NA |
+                                Df        Sum Sq     Mean Sq      F value      Pr(>F)
+----------------------------  ----  ------------  ----------  -----------  ----------
+coaBlockIndex                    1     8.5593621   8.5593621   16.9380538   0.0000490
+COA                              2     0.0060435   0.0030217    0.0059797   0.9940382
+Condition                        1     3.4040437   3.4040437    6.7362351   0.0098773
+coaBlockIndex:COA                2     0.0254060   0.0127030    0.0251379   0.9751773
+coaBlockIndex:Condition          1     0.0010744   0.0010744    0.0021261   0.9632511
+COA:Condition                    2     0.0053423   0.0026712    0.0052859   0.9947281
+coaBlockIndex:COA:Condition      2     0.5221628   0.2610814    0.5166519   0.5970050
+Residuals                      324   163.7279790   0.5053333           NA          NA
 
-**RT: Permutation
-ANOVA**
 
-``` r
+**RT: Permutation ANOVA**
+
+```r
 kable(summary(aovp(RT ~ coaBlockIndex * COA * Condition, data= RT_coa))[[1]])
 ```
 
-    ## [1] "Settings:  unique SS : numeric variables centered"
+```
+## [1] "Settings:  unique SS : numeric variables centered"
+```
 
-|                             |  Df |    R Sum Sq | R Mean Sq | Iter | Pr(Prob) |
-| --------------------------- | --: | ----------: | --------: | ---: | -------: |
-| coaBlockIndex               |   1 |   8.5593621 | 8.5593621 | 5000 |        0 |
-| COA                         |   2 |   0.0060435 | 0.0030217 |   51 |        1 |
-| coaBlockIndex:COA           |   2 |   0.0254060 | 0.0127030 |   51 |        1 |
-| Condition                   |   1 |   3.4040437 | 3.4040437 | 5000 |        0 |
-| coaBlockIndex:Condition     |   1 |   0.0010744 | 0.0010744 |   51 |        1 |
-| COA:Condition               |   2 |   0.0053423 | 0.0026712 |   51 |        1 |
-| coaBlockIndex:COA:Condition |   2 |   0.5221628 | 0.2610814 |   51 |        1 |
-| Residuals                   | 324 | 163.7279790 | 0.5053333 |   NA |       NA |
+                                Df      R Sum Sq   R Mean Sq   Iter    Pr(Prob)
+----------------------------  ----  ------------  ----------  -----  ----------
+coaBlockIndex                    1     8.5593621   8.5593621   5000   0.0000000
+COA                              2     0.0060435   0.0030217     51   1.0000000
+coaBlockIndex:COA                2     0.0254060   0.0127030     51   1.0000000
+Condition                        1     3.4040437   3.4040437   5000   0.0130000
+coaBlockIndex:Condition          1     0.0010744   0.0010744     51   0.9019608
+COA:Condition                    2     0.0053423   0.0026712     51   1.0000000
+coaBlockIndex:COA:Condition      2     0.5221628   0.2610814    230   0.5956522
+Residuals                      324   163.7279790   0.5053333     NA          NA
 
 **RT: Bayesian ANOVA**
 
-``` r
+
+```r
 RT_coa %>%
   ungroup() %>%
   mutate(coaBlockIndex= as.factor(coaBlockIndex)) %>%
@@ -278,109 +372,108 @@ RT_coa %>%
   kable(.)
 ```
 
-    ## Warning: data coerced from tibble to data frame
-
-|                                                                                                                             |         bf |     error |
-| --------------------------------------------------------------------------------------------------------------------------- | ---------: | --------: |
-| Condition                                                                                                                   |  2.7634003 | 0.0000000 |
-| COA                                                                                                                         |  0.0326108 | 0.0001208 |
-| Condition + COA                                                                                                             |  0.0883085 | 0.0155336 |
-| Condition + COA + Condition:COA                                                                                             |  0.0051862 | 0.0141986 |
-| coaBlockIndex                                                                                                               | 27.0903428 | 0.0000054 |
-| Condition + coaBlockIndex                                                                                                   | 85.2642734 | 0.0125519 |
-| COA + coaBlockIndex                                                                                                         |  0.8701515 | 0.0125793 |
-| Condition + COA + coaBlockIndex                                                                                             |  2.7134872 | 0.0220237 |
-| Condition + COA + Condition:COA + coaBlockIndex                                                                             |  0.1652246 | 0.0173614 |
-| Condition + coaBlockIndex + Condition:coaBlockIndex                                                                         |  4.7191561 | 0.0591977 |
-| Condition + COA + coaBlockIndex + Condition:coaBlockIndex                                                                   |  0.1387329 | 0.0143291 |
-| Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex                                                   |  0.0112556 | 0.2164338 |
-| COA + coaBlockIndex + COA:coaBlockIndex                                                                                     |  0.0105425 | 0.0104219 |
-| Condition + COA + coaBlockIndex + COA:coaBlockIndex                                                                         |  0.0347163 | 0.0476607 |
-| Condition + COA + Condition:COA + coaBlockIndex + COA:coaBlockIndex                                                         |  0.0020289 | 0.0325059 |
-| Condition + COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                                               |  0.0017596 | 0.0221032 |
-| Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                               |  0.0001016 | 0.0255693 |
-| Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex + Condition:COA:coaBlockIndex |  0.0000044 | 0.0369530 |
-
-``` r
-rm(RT_coa, RT_plot)
+```
+## Warning: data coerced from tibble to data frame
 ```
 
-## Effect of the cue-onset asynchrony (COA) and experimental condition on *total score*
+                                                                                                                                       bf       error
+----------------------------------------------------------------------------------------------------------------------------  -----------  ----------
+Condition                                                                                                                       2.7634003   0.0000000
+COA                                                                                                                             0.0326108   0.0001208
+Condition + COA                                                                                                                 0.0879200   0.0164691
+Condition + COA + Condition:COA                                                                                                 0.0053783   0.0267189
+coaBlockIndex                                                                                                                  27.0903428   0.0000054
+Condition + coaBlockIndex                                                                                                      84.2480944   0.0126515
+COA + coaBlockIndex                                                                                                             0.8812840   0.0119948
+Condition + COA + coaBlockIndex                                                                                                 2.7678558   0.0162078
+Condition + COA + Condition:COA + coaBlockIndex                                                                                 0.1760305   0.0409290
+Condition + coaBlockIndex + Condition:coaBlockIndex                                                                             4.2654107   0.0148172
+Condition + COA + coaBlockIndex + Condition:coaBlockIndex                                                                       0.1531740   0.0459070
+Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex                                                       0.0093866   0.0886329
+COA + coaBlockIndex + COA:coaBlockIndex                                                                                         0.0103358   0.0104064
+Condition + COA + coaBlockIndex + COA:coaBlockIndex                                                                             0.0351321   0.0271588
+Condition + COA + Condition:COA + coaBlockIndex + COA:coaBlockIndex                                                             0.0019110   0.0165301
+Condition + COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                                                   0.0016893   0.0246050
+Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                                   0.0001060   0.0387483
+Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex + Condition:COA:coaBlockIndex     0.0000042   0.0306626
 
-``` r
-score_coa <- results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
-  summarise(`Block Score`= sum(score))
 
-# plot with SE as errorbars
-score_plot <- score_coa %>%
+```r
+rm(RT_coa)
+```
+
+## Effect of the cue-onset asynchrony (COA) and experimental condition on _total score_
+
+```r
+groupScore <- results %>%
   group_by(Condition, COA, coaBlockIndex) %>%
-  summarise(Score_avg= mean(`Block Score`), 
-            Score_serr= sd(`Block Score`)/sqrt(n()-1), 
-            Score_lo= Score_avg-Score_serr, 
-            Score_hi= Score_avg+Score_serr) %>%
+  do(getvariableCI(data= ., variableOfInterest = 'score', seed = 1538989294))
 
-ggplot(aes(x= coaBlockIndex, y= Score_avg, ymin= Score_lo, ymax= Score_hi,
+ggplot(data= groupScore, 
+       aes(x= coaBlockIndex, y= meanValue, ymin= bcaLower, ymax= bcaUpper,
            color= Condition, linetype= Condition)) + 
-  geom_errorbar(width= 0.3)+
+  geom_errorbar(width= 0.3, linetype= 'solid')+
   geom_line() +
   geom_point(aes(shape= Condition), size= 3) +
   # geom_point(position = position_jitter(width= 0.2), color= 'black') +
   facet_grid(.~COA) +
-  ylab('Score [points]') +
-  xlab('Block index') + 
+  ylab('Score [thousands of points]') +
+  xlab('Block index') +
   theme(panel.grid.minor.x = element_blank(), legend.position = "none")
-print(score_plot)
 ```
 
-![](Gamification_Analysis_files/figure-gfm/COA%20on%20Score-1.png)<!-- -->
+![](Gamification_Analysis_files/figure-html/Score-1.png)<!-- -->
 
-``` r
-# ggsave('Between-Score.pdf', score_plot, path= 'Plots', width = 20, height = 20/1.5, units = 'cm', useDingbats= FALSE)
-```
 
 **Score: Frequentist ANOVA**
 
-``` r
+```r
 # frequentist ANOVA
 # frequentist ANOVA
+score_coa <- results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  summarise(`Block Score`= sum(score))
+
 kable(summary(aov(`Block Score` ~ coaBlockIndex * COA * Condition, data= score_coa))[[1]])
 ```
 
-|                             |  Df |       Sum Sq |    Mean Sq |    F value |   Pr(\>F) |
-| --------------------------- | --: | -----------: | ---------: | ---------: | --------: |
-| coaBlockIndex               |   1 |   56330349.0 | 56330349.0 | 15.9337826 | 0.0000812 |
-| COA                         |   2 |   60049892.9 | 30024946.4 |  8.4929523 | 0.0002541 |
-| Condition                   |   1 |    5722164.0 |  5722164.0 |  1.6185896 | 0.2042009 |
-| coaBlockIndex:COA           |   2 |   12342389.1 |  6171194.5 |  1.7456038 | 0.1761770 |
-| coaBlockIndex:Condition     |   1 |      13645.8 |    13645.8 |  0.0038599 | 0.9504992 |
-| COA:Condition               |   2 |    4163687.5 |  2081843.7 |  0.5888770 | 0.5555430 |
-| coaBlockIndex:COA:Condition |   2 |     633022.2 |   316511.1 |  0.0895293 | 0.9143841 |
-| Residuals                   | 324 | 1145430033.5 |  3535277.9 |         NA |        NA |
+                                Df         Sum Sq      Mean Sq      F value      Pr(>F)
+----------------------------  ----  -------------  -----------  -----------  ----------
+coaBlockIndex                    1     56330349.0   56330349.0   15.9337826   0.0000812
+COA                              2     60049892.9   30024946.4    8.4929523   0.0002541
+Condition                        1      5722164.0    5722164.0    1.6185896   0.2042009
+coaBlockIndex:COA                2     12342389.1    6171194.5    1.7456038   0.1761770
+coaBlockIndex:Condition          1        13645.8      13645.8    0.0038599   0.9504992
+COA:Condition                    2      4163687.5    2081843.7    0.5888770   0.5555430
+coaBlockIndex:COA:Condition      2       633022.2     316511.1    0.0895293   0.9143841
+Residuals                      324   1145430033.5    3535277.9           NA          NA
 
-**Score: Permutation
-ANOVA**
 
-``` r
+**Score: Permutation ANOVA**
+
+```r
 kable(summary(aovp(`Block Score` ~ coaBlockIndex * COA * Condition, data= score_coa))[[1]])
 ```
 
-    ## [1] "Settings:  unique SS : numeric variables centered"
+```
+## [1] "Settings:  unique SS : numeric variables centered"
+```
 
-|                             |  Df |     R Sum Sq |  R Mean Sq | Iter |  Pr(Prob) |
-| --------------------------- | --: | -----------: | ---------: | ---: | --------: |
-| coaBlockIndex               |   1 |   56330349.0 | 56330349.0 | 5000 | 0.0000000 |
-| COA                         |   2 |   60049892.9 | 30024946.4 | 5000 | 0.0000000 |
-| coaBlockIndex:COA           |   2 |   12342389.1 |  6171194.5 |  442 | 0.3552036 |
-| Condition                   |   1 |    5722164.0 |  5722164.0 | 1256 | 0.0740446 |
-| coaBlockIndex:Condition     |   1 |      13645.8 |    13645.8 |   51 | 1.0000000 |
-| COA:Condition               |   2 |    4163687.5 |  2081843.7 |  184 | 0.7228261 |
-| coaBlockIndex:COA:Condition |   2 |     633022.2 |   316511.1 |   51 | 1.0000000 |
-| Residuals                   | 324 | 1145430033.5 |  3535277.9 |   NA |        NA |
+                                Df       R Sum Sq    R Mean Sq   Iter    Pr(Prob)
+----------------------------  ----  -------------  -----------  -----  ----------
+coaBlockIndex                    1     56330349.0   56330349.0   5000   0.0000000
+COA                              2     60049892.9   30024946.4   5000   0.0000000
+coaBlockIndex:COA                2     12342389.1    6171194.5   5000   0.1934000
+Condition                        1      5722164.0    5722164.0    686   0.1282799
+coaBlockIndex:Condition          1        13645.8      13645.8     51   0.8235294
+COA:Condition                    2      4163687.5    2081843.7    706   0.2733711
+coaBlockIndex:COA:Condition      2       633022.2     316511.1     94   1.0000000
+Residuals                      324   1145430033.5    3535277.9     NA          NA
 
 **Score: Bayesian ANOVA**
 
-``` r
+
+```r
 score_coa %>%
   ungroup() %>%
   mutate(coaBlockIndex= as.factor(coaBlockIndex)) %>%
@@ -390,49 +483,58 @@ score_coa %>%
   kable(.)
 ```
 
-    ## Warning: data coerced from tibble to data frame
+```
+## Warning: data coerced from tibble to data frame
+```
 
-|                                                                                                                             |           bf |     error |
-| --------------------------------------------------------------------------------------------------------------------------- | -----------: | --------: |
-| Condition                                                                                                                   |    0.2463402 | 0.0000003 |
-| COA                                                                                                                         |   53.8523013 | 0.0000876 |
-| Condition + COA                                                                                                             |   13.4400577 | 0.0194179 |
-| Condition + COA + Condition:COA                                                                                             |    1.2724966 | 0.0163268 |
-| coaBlockIndex                                                                                                               |   55.7763590 | 0.0000041 |
-| Condition + coaBlockIndex                                                                                                   |   14.0161539 | 0.0158056 |
-| COA + coaBlockIndex                                                                                                         | 4580.7665690 | 0.0212503 |
-| Condition + COA + coaBlockIndex                                                                                             | 1214.6783625 | 0.0203006 |
-| Condition + COA + Condition:COA + coaBlockIndex                                                                             |  123.2494771 | 0.0607180 |
-| Condition + coaBlockIndex + Condition:coaBlockIndex                                                                         |    0.7729100 | 0.1265104 |
-| Condition + COA + coaBlockIndex + Condition:coaBlockIndex                                                                   |   59.9744839 | 0.0306614 |
-| Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex                                                   |    5.5625822 | 0.0204364 |
-| COA + coaBlockIndex + COA:coaBlockIndex                                                                                     |  279.1508049 | 0.0233573 |
-| Condition + COA + coaBlockIndex + COA:coaBlockIndex                                                                         |   71.7659024 | 0.0157168 |
-| Condition + COA + Condition:COA + coaBlockIndex + COA:coaBlockIndex                                                         |    7.5434911 | 0.0273868 |
-| Condition + COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                                               |    3.6665616 | 0.0214184 |
-| Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                               |    0.3787772 | 0.0451672 |
-| Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex + Condition:COA:coaBlockIndex |    0.0211337 | 0.0938208 |
+                                                                                                                                         bf       error
+----------------------------------------------------------------------------------------------------------------------------  -------------  ----------
+Condition                                                                                                                         0.2463402   0.0000003
+COA                                                                                                                              53.8523013   0.0000876
+Condition + COA                                                                                                                  13.4403139   0.0196401
+Condition + COA + Condition:COA                                                                                                   1.3076253   0.0288018
+coaBlockIndex                                                                                                                    55.7763590   0.0000041
+Condition + coaBlockIndex                                                                                                        14.1482004   0.0125327
+COA + coaBlockIndex                                                                                                            4392.1696966   0.0082750
+Condition + COA + coaBlockIndex                                                                                                1188.9838540   0.0231637
+Condition + COA + Condition:COA + coaBlockIndex                                                                                 127.3012040   0.0695955
+Condition + coaBlockIndex + Condition:coaBlockIndex                                                                               0.7071780   0.0650855
+Condition + COA + coaBlockIndex + Condition:coaBlockIndex                                                                        58.0628060   0.0386965
+Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex                                                         5.6819413   0.0242080
+COA + coaBlockIndex + COA:coaBlockIndex                                                                                         282.0096646   0.0234094
+Condition + COA + coaBlockIndex + COA:coaBlockIndex                                                                              76.6034434   0.0232715
+Condition + COA + Condition:COA + coaBlockIndex + COA:coaBlockIndex                                                               7.3872742   0.0239872
+Condition + COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                                                     3.5803429   0.0163687
+Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex                                     0.3549484   0.0273893
+Condition + COA + Condition:COA + coaBlockIndex + Condition:coaBlockIndex + COA:coaBlockIndex + Condition:COA:coaBlockIndex       0.0201239   0.0385784
 
-``` r
+```r
 rm(score_coa, score_plot)
 ```
 
+```
+## Warning in rm(score_coa, score_plot): Objekt 'score_plot' nicht gefunden
+```
+
+
+
 # Post-study questionnaires
 
-``` r
+
+```r
 questionnaire <- suppressMessages(read_csv2(file.path('Questionnaire', 'Questionnaire_ErsteTestung_ohneIFN.csv'))) %>%
   ungroup() %>%
-  mutate(Condition= as.factor(Condition),
-         Condition= fct_recode(Condition, 'experiment'= '2', 'game'= '1'), 
+  mutate(Condition= as.factor(Condition), 
+         Condition= fct_recode(Condition, game= '1', experiment= '2'), 
          Condition= fct_relevel(Condition, 'experiment'))
 ```
 
 ## Gamer/Non-gamer
 
-This questionnaire is important to check the balance between the two
-experimental groups
+This questionnaire is important to check the balance between the two experimental groups
 
-``` r
+
+```r
 gamer <- questionnaire %>%
   mutate(d_nonGamer= sqrt((GP01_01-2.58)^2+(GP02_01-1.61)^2+
                      (GP02_02-1.88)^2+(GP02_03-4.3)^2+
@@ -444,33 +546,33 @@ gamer <- questionnaire %>%
 oneway_test(d_nonGamer ~ Condition, gamer)
 ```
 
-    ## 
-    ##  Asymptotic Two-Sample Fisher-Pitman Permutation Test
-    ## 
-    ## data:  d_nonGamer by Condition (experiment, game)
-    ## Z = -0.37617, p-value = 0.7068
-    ## alternative hypothesis: true mu is not equal to 0
+```
+## 
+## 	Asymptotic Two-Sample Fisher-Pitman Permutation Test
+## 
+## data:  d_nonGamer by Condition (experiment, game)
+## Z = -0.37617, p-value = 0.7068
+## alternative hypothesis: true mu is not equal to 0
+```
 
-``` r
+```r
 gamer_plot <- gamer %>% ggplot(aes(x= Condition, y= d_nonGamer, color= Condition)) +
   geom_boxplot(outlier.shape = NA) + 
-  geom_point(position = position_jitter(height = 0, width = 0.2), color= 'black') + 
+  geom_point(position = position_dodge2(width= 0.05), color= 'black') + 
   ylab("Distance to non-gamers' cluster") + 
   theme(panel.grid.major.x = element_blank(), legend.position = "none")
 print(gamer_plot)
 ```
 
-![](Gamification_Analysis_files/figure-gfm/Gamer-1.png)<!-- -->
+![](Gamification_Analysis_files/figure-html/Gamer-1.png)<!-- -->
 
-``` r
-# ggsave('Gaming habits.pdf', path= 'Plots', width = 12, height = 8, units = 'cm', useDingbats= FALSE)
-
+```r
 rm(gamer, gamer_plot)
 ```
 
 ## Intrinsic Motivation
 
-``` r
+```r
 # computing subscales for the Intrinsic Motivation
 IM <- questionnaire %>%
   mutate(enjoyment =  ((IM01_01 + IM01_05 + IM01_08 + IM01_10 + IM01_14 + IM01_17 + IM01_20)/7),
@@ -497,27 +599,27 @@ IM %>%
   kable(.)
 ```
 
-| Subscale   |           Z |    pvalue | p(adjusted) |
-| :--------- | ----------: | --------: | ----------: |
-| choice     | \-0.2628970 | 0.7926300 |   1.0000000 |
-| competence | \-0.5404975 | 0.5888540 |   1.0000000 |
-| enjoyment  | \-2.7117838 | 0.0066922 |   0.0267689 |
-| pressure   |   0.8032385 | 0.4218369 |   1.0000000 |
 
-``` r
+
+Subscale               Z      pvalue   p(adjusted)
+-----------  -----------  ----------  ------------
+choice        -0.2628970   0.7926300     1.0000000
+competence    -0.5404975   0.5888540     1.0000000
+enjoyment     -2.7117838   0.0066922     0.0267689
+pressure       0.8032385   0.4218369     1.0000000
+
+```r
 IM_plot <- IM %>% ggplot(aes(x= Condition, y= Response, color= Condition)) +
   geom_boxplot(outlier.shape = NA) + 
-  geom_point(position = position_jitter(height = 0, width = 0.2), color= 'black') + 
+  geom_point(position = position_dodge2(width = 0.15), color= 'black') + 
   facet_grid(. ~ Subscale) + 
   theme(panel.grid.major.x = element_blank(), legend.position = "none")
 
 print(IM_plot)
 ```
 
-![](Gamification_Analysis_files/figure-gfm/IM-1.png)<!-- -->
+![](Gamification_Analysis_files/figure-html/IM-1.png)<!-- -->
 
-``` r
-# ggsave('IM.pdf', IM_plot, path= 'Plots', width = 24, height = 16, units = 'cm', useDingbats= FALSE)
-
+```r
 rm('oneway_permutation_test', IM, IM_plot)
 ```
