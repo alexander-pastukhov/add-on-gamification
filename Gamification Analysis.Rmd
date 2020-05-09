@@ -16,29 +16,82 @@ knitr::opts_chunk$set(echo = TRUE)
 ```
 
 ```{r libraries, message=FALSE, warning=FALSE}
-suppressMessages(library('tidyverse'))
-library('fs')
-library('knitr')
-library('lme4')
-library('lmerTest')
-library('BayesFactor')
-library('psycho')
-library('coin')
-library('car')
-library('lmPerm')
-library('boot')
-library('psych')
-library("psycho")
-library("sjstats")
+library(boot)
+library(brms)
+library(fs)
+library(ggbeeswarm)
+library(knitr)
+library(psycho)
+library(tidyverse)
 ```
 
-# Loading and preprocessing the data
+```{r Tabula rasa}
+rm(list= ls())
+```
+
+## Utility functions
+
+### Summarizies a brms model via drop-one method 
+```{r model summary}
+summarize_models <- function(brm_model, 
+                             terms = c("Condition", "COA", "coaBlockIndex", "d_nonGamer", "Condition:coaBlockIndex")){
+
+  # reduced models, taking out one term at a time
+  reduced_models <- purrr::map(terms, ~update(brm_model, formula. = as.formula(stringr::str_c("~ . - ", .)),  cores = future::availableCores()))
+  names(reduced_models) <- terms
+  
+  brm_model <- brms::add_criterion(brm_model, "loo", reloo=TRUE)
+  reduced_models <- purrr::map(reduced_models, ~brms::add_criterion(., "loo", , reloo=TRUE))
+  
+  comparison_with_the_full_model_loo <- purrr::map(reduced_models, ~brms::loo_compare(brm_model, .))
+  model_weight_via_loo <- purrr::map(reduced_models, ~brms::loo_model_weights(brm_model, .))
+  
+  
+  loos <-
+    purrr::map2(comparison_with_the_full_model_loo, 
+              names(comparison_with_the_full_model_loo), 
+              ~broom.mixed::tidy(.x) %>% 
+                rename(term = .rownames) %>%
+                mutate(elpd_diff = ifelse(term!=".", -elpd_diff, elpd_diff)) %>%
+                filter(elpd_diff != 0) %>%
+                mutate(term = .y)) %>%
+    bind_rows() %>%
+    mutate_if(is.numeric, round, digits=2) %>%
+    mutate(dLOO= stringr::str_c(elpd_diff, "±", se_diff)) %>%
+    select(term, dLOO)
+  
+  weights <-
+    purrr::map2(model_weight_via_loo, 
+                names(model_weight_via_loo),
+               ~c(.x)[2]) %>%
+                bind_rows() %>%
+                t() %>%
+                data.frame() %>%
+                tibble::rownames_to_column("term") %>%
+                dplyr::rename(weight=2) %>%
+                mutate(weight = round(weight, 2))
+
+  brms_summary <- 
+    broom.mixed::tidy(brm_model) %>%
+    filter(effect == "fixed", term!="(Intercept)") %>%
+    select(-component, -group, - effect) %>%
+    mutate(term = stringr::str_replace_all(term, c("Conditiongame"="Condition"))) %>%
+    left_join(loos, by="term") %>%
+    left_join(weights, by="term") %>%
+    mutate(term = stringr::str_replace_all(term, "Conditiongame", "Condition")) %>%
+    mutate_if(is.numeric, round, digits=2) %>%
+    mutate(CI = glue::glue("{conf.low}..{conf.high}")) %>%
+    select(term, estimate, CI, dLOO, weight)
+
+  brms_summary
+}
+```
+
+## Loading and preprocessing the data
 
 ```{r Loading}
-rm(list= ls())
-
 results <-
-  tibble(filename= dir_ls(path= "Data", type= "file", regexp = 'csv$')) %>%
+  tibble(filename= fs::dir_ls(path= "Data", type= "file", regexp = 'csv$')) %>%
   rowwise() %>%
   do(read_csv2(.$filename, 
                locale = locale(decimal_mark = ","),
@@ -138,90 +191,130 @@ questionnaire <- suppressMessages(read_csv2(file.path('Questionnaire', 'Question
          Condition= fct_relevel(Condition, 'experiment'))
 ```
 
-## Gamer/Non-gamer
-
+## Gamer habits
 This questionnaire is important to check the balance between the two experimental groups
 
 ```{r, Gamer}
-gamer <- questionnaire %>%
-  mutate(d_nonGamer= sqrt((GP01_01-2.58)^2+(GP02_01-1.61)^2+
-                     (GP02_02-1.88)^2+(GP02_03-4.3)^2+
-                     (GP02_04-1.49)^2+(GP02_05-2.69)^2+
-                     (GP02_06-2.20)^2+(GP02_07-2.59)^2+
-                     (GP02_08-4.68)^2+(GP02_09-2.20)^2)) %>%
+gamer <- 
+  questionnaire %>%
+  mutate(d_nonGamer= sqrt((GP01_01-2.58)^2+
+                          (GP02_01-1.61)^2+
+                          (GP02_02-1.88)^2+
+                          (GP02_03-4.3)^2+
+                          (GP02_04-1.49)^2+
+                          (GP02_05-2.69)^2+
+                          (GP02_06-2.20)^2+
+                          (GP02_07-2.59)^2+
+                          (GP02_08-4.68)^2+
+                          (GP02_09-2.20)^2)) %>%
   select(Observer, Condition, d_nonGamer)
 
 # adding gaming preference to results
 results <- 
   results %>%
-  left_join(gamer, by=c("Observer", "Condition")) %>%
+  left_join(gamer %>% mutate(Condition = as.character(Condition)), by=c("Observer", "Condition")) %>%
   ungroup() %>%
   mutate(Condition= as.factor(Condition),
          Observer= as.factor(Observer))
 
-
-oneway_test(d_nonGamer ~ Condition, gamer)
-ttestBF(formula= d_nonGamer ~ Condition, data= data.frame(gamer))
+```
 
 
-gamer_plot <- gamer %>% ggplot(aes(x= Condition, y= d_nonGamer, color= Condition)) +
+Plots and formal analysis
+
+```{r}
+gamer_cohen_d <- psych::cohen.d(gamer$d_nonGamer, gamer$Condition)
+gaming_alpha <- psych::alpha(questionnaire %>% select(starts_with('GP')) %>% select(-GP03_01))
+
+gamer_brms <- brms::brm(d_nonGamer ~ Condition,
+                        data=gamer,
+                        save_all_pars = TRUE,
+                        cores=future::availableCores())
+gamer_brms<- brms::add_criterion(gamer_brms, "loo")
+
+gamer_intercept_brms <- brms::brm(d_nonGamer ~ 1,
+                                  data=gamer,
+                                  save_all_pars = TRUE,
+                                  cores=future::availableCores())
+gamer_intercept_brms <- brms::add_criterion(gamer_intercept_brms, "loo")
+
+brms::loo_compare(gamer_brms, gamer_intercept_brms)
+brms::loo_model_weights(gamer_brms, gamer_intercept_brms)
+
+ggplot(gamer, 
+       aes(x= Condition, y= d_nonGamer, color= Condition)) +
   geom_boxplot(outlier.shape = NA) + 
-  geom_point(position = position_dodge2(width= 0.05), color= 'black') + 
+  geom_quasirandom(width= 0.05, color= 'black', method="tukeyDense") + 
   ylab("Distance to non-gamers' cluster") + 
   theme(panel.grid.major.x = element_blank(), legend.position = "none")
-print(gamer_plot)
-```
-
-
-
-```{r}
-gaming_alpha <- psych::alpha(questionnaire %>% select(starts_with('GP')) %>% select(-GP03_01))
-```
-Internal consistency for Gamer/Non-gamer questionnaire is `r gaming_alpha$total$std.alpha`.
-
-```{r}
-rm(gaming_alpha)
 ```
 
 ## Intrinsic Motivation
-```{r, IM}
+```{r IM}
 # computing subscales for the Intrinsic Motivation
-IM <- questionnaire %>%
-  mutate(enjoyment =  ((IM01_01 + IM01_05 + IM01_08 + IM01_10 + IM01_14 + IM01_17 + IM01_20)/7),
-         competence = ((IM01_04 + IM01_07 + IM01_12 + IM01_16 + IM01_22)/5),
-         choice = ((IM01_03 + IM01_11 + IM01_15 + IM01_19 + IM01_21)/5),
-         pressure =((IM01_02 + IM01_06 + IM01_09 + IM01_13 + IM01_18)/5)) %>%
-  
-  select(Observer, Condition, enjoyment, competence, choice, pressure) %>%
-  gather(key= "Subscale", value = "Response", -Observer, -Condition)
+ qsubscale <- tibble(subscale = c("enjoyment", "competence", "choice", "pressure"),
+                     questions = list(c("IM01_01", "IM01_05", "IM01_08", "IM01_10", "IM01_14", "IM01_17", "IM01_20"),
+                                      c("IM01_04", "IM01_07", "IM01_12", "IM01_16", "IM01_22"),
+                                      c("IM01_03", "IM01_11", "IM01_15", "IM01_19", "IM01_21"),
+                                      c("IM01_02", "IM01_06", "IM01_09", "IM01_13", "IM01_18")))
 
-t_tests <- function(subscaleDF){
-  test_results <- oneway_test(Response ~ Condition, data= subscaleDF)
-  
-  bf_results <- extractBF(ttestBF(formula= Response ~ Condition, data= data.frame(subscaleDF)))
-  
-  
-  tibble(Subscale= subscaleDF$Subscale[1], BF= bf_results$bf, `BF error`= bf_results$error, Z= statistic(test_results), pvalue= pvalue(test_results))
-}
+qsubscale <- 
+  qsubscale %>%
+  group_by(subscale) %>%
+  mutate(responses =  purrr::map2(subscale, questions, 
+                                 ~questionnaire %>%
+                                  dplyr::select_at(c("Condition", "Observer", .y)))) %>%
+  mutate(responses = purrr::map(responses, ~tidyr::pivot_longer(., cols=-one_of(c("Condition", "Observer")),
+                                                                names_to = "Question", values_to = "Response"))) %>%
+  mutate(responses = purrr::map(responses, ~left_join(., 
+                                                      gamer %>% mutate(Condition = as.character(Condition)), 
+                                                      by=c("Observer", "Condition"))))
 
-# Fisher-Pitman permutation test on each subscale, multiple comparions adjustment via Holm's method 
-IM %>% 
-  group_by(Subscale) %>%
-  do(t_tests(.)) %>%
-  ungroup() %>%
-  mutate(`p(adjusted)`= p.adjust(pvalue, method = 'holm')) %>%
-  kable(.)
 
-IM_plot <- IM %>% ggplot(aes(x= Condition, y= Response, color= Condition)) +
+
+# full model
+set.seed(2323357)
+qsubscale <- 
+  qsubscale %>%
+  mutate(brms_fit = purrr::map(responses, ~brms::brm(Response ~ Condition + d_nonGamer + (1|Observer), 
+                                                     brms::cumulative("logit"),
+                                                     data=.,
+                                                     cores=future::availableCores())))
+
+qsubscale <- 
+  qsubscale %>%
+  mutate(ModelSummary = purrr::map(brms_fit, ~summarize_models(., terms = c("Condition", "d_nonGamer"))))
+
+
+qsubscale %>%
+  mutate(ModelSummary = purrr::map(ModelSummary, ~mutate(., CI = as.character(CI)))) %>%
+  dplyr::select(subscale, ModelSummary) %>%
+  tidyr::unnest(ModelSummary) %>%
+  na.omit() %>%
+  select(-ps) %>%
+  arrange(subscale)
+```
+
+  
+```{r}
+
+IM <-
+  qsubscale %>%
+  select(subscale, responses) %>%
+  unnest(responses) %>%
+  rename(Subscale = subscale) %>%
+  group_by(Subscale, Condition, Observer) %>%
+  summarise(Response = mean(Response))
+
+
+ggplot(IM, aes(x= Condition, y= Response, color= Condition)) +
   geom_boxplot(outlier.shape = NA) + 
-  geom_point(position = position_dodge2(width = 0.15), color= 'black') + 
+  ggbeeswarm::geom_quasirandom(color= 'black', width=0.2) + 
   facet_grid(. ~ Subscale) + 
   theme(panel.grid.major.x = element_blank(), legend.position = "none")
 
-print(IM_plot)
 ggsave("IM.pdf", width = 14, height = 8, units = 'cm', useDingbats = FALSE)
 
-# rm('oneway_permutation_test', IM, IM_plot)
 ```
 Internal consistency
 ```{r}
@@ -311,29 +404,6 @@ groupPerformance <- results %>%
   do(getvariableCI(data= ., variableOfInterest = 'Correct', seed = 1538985527))
 ```
 
-```{r}
-test_measure <- function(df){
-  # frequentist ANOVA
-  anova_performance <- aov(value ~ coaBlockIndex * COA * Condition * d_nonGamer, data= df)
-  anova_table <- 
-    data.frame(head(summary(anova_performance)[[1]], -1)) %>%
-    rownames_to_column("factor")
-  
-  lm_table <- data.frame(summary.lm(anova_performance)$coefficients[-1, ])
-  anova_table$t <- lm_table$t.value
-    
-  anova_table$cohens_f <- cohens_f(anova_performance)$cohens.f
-  
-  
-  perm_performance <- aovp(value ~ coaBlockIndex * COA * Condition * d_nonGamer, data= df)
-  perm_table <- 
-    data.frame(head(summary(perm_performance)[[1]], -1)) %>%
-    rownames_to_column("factor") %>%
-    select(-Df)
-  
-  left_join(anova_table, perm_table, by="factor")
-}
-```
 
 ```{r}
 ggplot(data= groupPerformance, 
@@ -344,7 +414,7 @@ ggplot(data= groupPerformance,
   geom_point(aes(shape= Condition), size= 3) +
   # geom_point(position = position_jitter(width= 0.2), color= 'black') +
   facet_grid(.~COA) +
-  ylab('Performance [%]') +
+  ylab('Accuracy [%]') +
   xlab('Block index') +
   theme(panel.grid.minor.x = element_blank(), legend.position = "none")
 
@@ -352,19 +422,24 @@ ggsave("performance.pdf", width = 12, height = 8, units = 'cm', useDingbats = FA
 
 ```
 
-Performance: ANOVA
-```{r, Performance - frequentist ANOVA}
-set.seed(557046)
-results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
-  summarise(d_nonGamer = d_nonGamer[1],
-            Performance= 100 * mean(Correct), 
-            logitPerformance= car::logit(Performance, percents = TRUE, adjust = 0.025), 
-            value = logitPerformance) %>%
-  test_measure(.) %>% 
-  select(factor, Df, F.value, t, Pr..F., Pr.Prob., cohens_f) %>%
-  kable(digits= c(0, 0, 1, 1, 4, 4,  2), 
-        col.names = c("Factor", "Df", "F", "t", "p(F)", "p(Perm)", "Cohen’s ƒ2"))
+
+```{r accuracy analysis}
+accuracy <- 
+  results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex, d_nonGamer) %>%
+  summarise(CorrectN= sum(Correct),
+            TotalN = n(),
+            CorrectP = CorrectN/TotalN) %>%
+  ungroup() %>%
+  mutate(COA = COA / 1000)
+
+accuracy_brm <- 
+  brms::brm(CorrectN  | trials(TotalN) ~ Condition + COA + coaBlockIndex + d_nonGamer + Condition:coaBlockIndex + (1|Observer),
+            data=accuracy,
+            family = "binomial",
+            cores = future::availableCores())
+
+summarize_models(accuracy_brm)
 ```
 
 ## Effect of the cue-onset asynchrony (COA) and experimental condition on _sensitivity_
@@ -372,12 +447,14 @@ results %>%
 ```{r sensitivity}
 sensitivity_per_observer <-
   results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
+  group_by(Observer, Condition, COA, coaBlockIndex, d_nonGamer) %>%
   summarise(n_hit = sum(Match=="match" & Response=="match"), 
             n_fa = sum(Match=="mismatch" & Response=="match"), 
             n_miss = sum(Match=="match" & Response=="mismatch"),
             n_cr = sum(Match=="mismatch" & Response=="mismatch"), 
-            dprime = dprime(n_hit, n_fa, n_miss, n_cr)$dprime)
+            dprime = dprime(n_hit, n_fa, n_miss, n_cr)$dprime) %>%
+  ungroup() %>%
+  mutate(COA = COA / 1000)
 
 
 groupSensitivity <-
@@ -398,6 +475,14 @@ ggplot(data= groupSensitivity,
   # theme(panel.grid.minor.x = element_blank(), legend.position = "none")
 ```
 
+```{r sensitivity analysis}
+sensitivity_brm <- 
+  brms::brm(dprime ~ Condition + COA + coaBlockIndex + d_nonGamer + Condition:coaBlockIndex + (1|Observer),
+            data=sensitivity_per_observer,
+            cores = future::availableCores())
+
+summarize_models(sensitivity_brm)
+```
 
 ## Effect of the cue-onset asynchrony (COA) and experimental condition on _response times_
 
@@ -423,18 +508,20 @@ ggplot(data= groupMedianRT,
 ggsave('RT.pdf', width = 12, height = 8, units = 'cm', useDingbats = FALSE)
 ```
 
-RT: ANOVA
-```{r RT - frequentist ANOVA}
-set.seed(450444)
-results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
-  summarise(d_nonGamer = d_nonGamer[1],
-            RT= median(RT), 
-            value = RT) %>%
-  test_measure(.) %>%
-  select(factor, Df, F.value, t, Pr..F., Pr.Prob., cohens_f) %>%
-  kable(digits= c(0, 0, 1, 1, 4, 4,  2), 
-        col.names = c("Factor", "Df", "F", "t", "p(F)", "p(Perm)", "Cohen’s ƒ2"))
+```{r RT analysis}
+RT <- 
+  results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex, d_nonGamer) %>%
+  summarise(MedianRT = median(RT)) %>%
+  ungroup() %>%
+  mutate(COA = COA / 1000)
+
+rt_brm <- 
+  brms::brm(MedianRT ~ Condition + COA + coaBlockIndex + d_nonGamer + Condition:coaBlockIndex + (1|Observer),
+            data=RT,
+            cores = future::availableCores())
+
+summarize_models(rt_brm)
 ```
 
 ## Effect of the cue-onset asynchrony (COA) and experimental condition on _total score_
@@ -460,19 +547,336 @@ ggsave('score.pdf', width = 12, height = 8, units = 'cm', useDingbats = FALSE)
 ```
 
 
-**Score: Frequentist and permutation ANOVA**
-```{r Score - frequentist ANOVA}
-set.seed(270453)
-results %>%
-  group_by(Observer, Condition, COA, coaBlockIndex) %>%
-  summarise(d_nonGamer = d_nonGamer[1],
-            `Block Score`= sum(score), 
-            value = `Block Score`) %>%
-  test_measure(.) %>%
-  select(factor, Df, F.value, t, Pr..F., Pr.Prob., cohens_f) %>%
-  kable(digits= c(0, 0, 1, 1, 4, 4,  2), 
-        col.names = c("Factor", "Df", "F", "t", "p(F)", "p(Perm)", "Cohen’s ƒ2"))
+```{r score analysis}
+score <-
+  results %>%
+  group_by(Observer, Condition, COA, coaBlockIndex, d_nonGamer) %>%
+  summarise(BlockScore= sum(score)/1000)
+
+score_brm <- 
+  brms::brm(BlockScore ~ Condition + COA + coaBlockIndex + d_nonGamer + Condition:coaBlockIndex + (1|Observer),
+            data=score %>% ungroup() %>% mutate(COA = COA / 1000),
+            cores = future::availableCores())
+
+summarize_models(score_brm)
+```
+
+## Additional analysis, for "game" condition group only
+
+```{r position in highscore table}
+hstable <- read_csv("highscore-position.csv",
+                    col_types = cols(Observer = col_character(),
+                                     Block = col_double(),
+                                     Score = col_double(),
+                                     AverageScore = col_double(),
+                                     iObserver = col_double(),
+                                     SessionID = col_character(),
+                                     COA = col_double(),
+                                     coaBlockIndex = col_double(),
+                                     Condition = col_character(),
+                                     IsLate = col_logical(),
+                                     BlockPos = col_double(),
+                                     AvgPos = col_double())) %>%
+  # participants will be influenced by the previous block only
+  group_by(Observer) %>%
+  mutate(PrevBlockPos = lag(BlockPos),
+         PrevAvgPos = lag(AvgPos)) %>%
+  select(Observer, Block, PrevBlockPos, PrevAvgPos)
+
+game <-
+  results %>%
+  filter(Condition == "game") %>%
+  left_join(hstable, by=c("Observer", "Block")) %>%
+  mutate(COA = COA / 1000)
+```  
+
+### Performance
+```{r game performance}
+game_accuracy <-
+  game %>%
+  group_by(Observer, COA, coaBlockIndex, PrevBlockPos, PrevAvgPos, d_nonGamer) %>%
+  summarise(CorrectN = sum(Correct),
+            TotalN = n()) %>%
+  na.omit()
+
+set.seed(8482317)
+game_accuracy_brm <- brms::brm(CorrectN  | trials(TotalN) ~  coaBlockIndex + COA + d_nonGamer + PrevBlockPos + PrevAvgPos + (1|Observer),
+            data=game_accuracy,
+            family = "binomial",
+            cores = future::availableCores())
+
+summarize_models(game_accuracy_brm, terms = c("coaBlockIndex", "COA", "d_nonGamer", "PrevBlockPos", "PrevAvgPos"))
+```
+
+### Sensitivity
+
+```{r game sensitivity}
+game_sensitivity <-
+  game %>%
+  group_by(Observer, COA, coaBlockIndex, d_nonGamer, PrevBlockPos, PrevAvgPos) %>%
+  summarise(n_hit = sum(Match=="match" & Response=="match"), 
+            n_fa = sum(Match=="mismatch" & Response=="match"), 
+            n_miss = sum(Match=="match" & Response=="mismatch"),
+            n_cr = sum(Match=="mismatch" & Response=="mismatch"), 
+            dprime = dprime(n_hit, n_fa, n_miss, n_cr)$dprime) %>%
+  ungroup() 
+
+set.seed(3963760)
+game_sensitivy_brm <- 
+  brms::brm(dprime ~  coaBlockIndex + COA + d_nonGamer + PrevBlockPos + PrevAvgPos + (1|Observer),
+            data=game_sensitivity,
+            control = list(max_treedepth=15),
+            cores = future::availableCores())
+
+summarize_models(game_sensitivy_brm, terms = c("PrevBlockPos", "PrevAvgPos"))
 ```
 
 
+### Response times
 
+```{r game RT}
+game_RT <-
+  game %>%
+  group_by(Observer, COA, coaBlockIndex, PrevBlockPos, PrevAvgPos, d_nonGamer) %>%
+  summarise(MedianRT= median(RT)) %>%
+  na.omit()
+
+set.seed(6196072)
+game_rt_brm <- 
+  brms::brm(MedianRT ~  coaBlockIndex + COA + d_nonGamer + PrevBlockPos + PrevAvgPos + (1|Observer),
+            data=game_RT,
+            control = list(max_treedepth=15),
+            cores = future::availableCores())
+
+summary(game_rt_brm)
+
+summarize_models(game_rt_brm, terms = c("PrevBlockPos", "PrevAvgPos"))
+
+```
+
+```{r game RT}
+game_RT <-
+  game %>%
+  group_by(Observer, COA, coaBlockIndex, PrevBlockPos, PrevAvgPos, d_nonGamer) %>%
+  summarise(MedianRT= median(RT)) %>%
+  na.omit()
+
+set.seed(6196072)
+game_rt_brm <- 
+  brms::brm(MedianRT ~  coaBlockIndex + COA + d_nonGamer + PrevBlockPos + PrevAvgPos + (1|Observer),
+            data=game_RT,
+            control = list(max_treedepth=15),
+            cores = future::availableCores())
+
+summary(game_rt_brm)
+
+summarize_models(game_rt_brm, terms = c("coaBlockIndex", "COA", "d_nonGamer", "PrevBlockPos", "PrevAvgPos"))
+
+```
+
+### Score
+```{r game score}
+game_score <-
+  game %>%
+  group_by(Observer, COA, coaBlockIndex, PrevBlockPos, PrevAvgPos, d_nonGamer) %>%
+  summarise(BlockScore= sum(score)) %>%
+  na.omit()
+
+set.seed(294713)
+game_score_brm <- 
+  brms::brm(BlockScore ~  coaBlockIndex + COA + d_nonGamer + PrevBlockPos + PrevAvgPos + (1|Observer),
+            data=game_score,
+            cores = future::availableCores())
+
+summarize_models(game_score_brm, terms = c("PrevBlockPos", "PrevAvgPos"))
+```
+
+
+## Mediation analysis
+
+### Regressing each subscale on experimental group (Condition) and gaming habits (d_nonGamer)
+
+```{r group-2-subscale}
+# single average score per subscale
+overall_IM <-
+  qsubscale %>%
+  dplyr::select(subscale, responses) %>%
+  tidyr::unnest(responses) %>%
+  group_by(subscale, Condition, Observer, d_nonGamer) %>%
+  dplyr::summarise(AvgResponse = mean(Response))
+
+# fitting each subscale
+subscale_models <- 
+  overall_IM %>%
+  group_by(subscale) %>%
+  tidyr::nest() %>%
+  mutate(subscale_model = purrr::map(data, 
+                                     ~brms::brm(AvgResponse ~ Condition + d_nonGamer,
+                                                data=.,
+                                                cores=future::availableCores())))
+
+# extracting posterior of the Group/Condition -> Subscale
+group2subscale <-
+  subscale_models %>%
+  mutate(subscale_via_condition = purrr::map(subscale_model,
+                                             ~tibble(Group2Subscale=brms::posterior_samples(.)$b_Conditiongame) %>% 
+                                               mutate(Iteration = 1:n()))) %>%
+  select(subscale, subscale_via_condition) %>%
+  tidyr::unnest(subscale_via_condition)
+
+
+```
+
+Function that computes an indirect effect and plots it
+```{r compute indirect}
+compute_indirect <- function(full_model){
+  accuracy_mediation_full_posterior <- brms::posterior_samples(full_model)
+  
+  # extracting beta for individual subscales
+  subscale2response <- 
+    tibble(choice=full_model_posterior$b_choice,
+           competence=full_model_posterior$b_competence,
+           enjoyment=full_model_posterior$b_enjoyment,
+           pressure=full_model_posterior$b_pressure) %>%
+    mutate(Iteration = 1:n()) %>%
+    tidyr::pivot_longer(cols=c("choice", "competence", "enjoyment", "pressure"), 
+                        names_to = "subscale", values_to = "Subscale2Response")
+
+  group2subscale2response <- 
+   left_join(group2subscale, subscale2response, by=c("subscale", "Iteration")) %>%
+    mutate(Indirect = Group2Subscale * Subscale2Response)
+}
+
+plot_indirect <- function(group2subscale2response){
+  positive_indirect <-
+    group2subscale2response %>%
+    group_by(subscale) %>%
+    summarise(AboveZero = round(100 * mean(Indirect > 0), 1),
+              AboveStr = glue::glue("Above 0: {AboveZero}%"))
+
+  ggplot(group2subscale2response, aes(x=Indirect)) +
+    geom_histogram(position = "identity", bins=100) +
+    geom_vline(xintercept = 0, color="white")+
+    geom_text(data=positive_indirect, aes(x=-Inf, y=Inf, label=AboveStr),  
+              hjust="left", vjust="top") +
+    facet_grid(subscale ~ ., scales="free_y")
+}
+
+```
+
+
+### Accuracy mediation
+
+```{r accuracy mediation}
+overall_accuracy <- 
+  results %>%
+  group_by(Observer, Condition, d_nonGamer) %>%
+  summarise(CorrectN= sum(Correct),
+            TotalN = n(),
+            CorrectP = CorrectN/TotalN) %>%
+  ungroup() %>%
+  left_join(overall_IM, by=c("Condition", "Observer", "d_nonGamer"))
+
+
+overall_accuracy_wide <-
+  overall_accuracy %>%
+  tidyr::pivot_wider(names_from = "subscale", values_from = "AvgResponse")
+
+accuracy_mediation_full_model <- brms::brm(CorrectN  | trials(TotalN) ~ Condition + d_nonGamer + choice + competence + enjoyment + pressure,
+                                           data = overall_accuracy_wide,
+                                           family = "binomial",
+                                           cores = future::availableCores())
+
+accuracy_group2subscale2response <- compute_indirect(accuracy_mediation_full_model)
+plot_indirect(accuracy_group2subscale2response)
+```
+
+```{r}
+overall_sensitivity <-
+  results %>%
+  group_by(Observer, Condition, d_nonGamer) %>%
+  summarise(n_hit = sum(Match=="match" & Response=="match"), 
+            n_fa = sum(Match=="mismatch" & Response=="match"), 
+            n_miss = sum(Match=="match" & Response=="mismatch"),
+            n_cr = sum(Match=="mismatch" & Response=="mismatch"), 
+            dprime = dprime(n_hit, n_fa, n_miss, n_cr)$dprime) %>%
+  ungroup() %>%
+  left_join(overall_IM, by=c("Condition", "Observer", "d_nonGamer"))
+
+
+overall_sensitivity_wide <-
+  overall_sensitivity %>%
+  tidyr::pivot_wider(names_from = "subscale", values_from = "AvgResponse")
+
+sensitivity_mediation_full_model <- brms::brm(dprime ~ Condition + d_nonGamer + choice + competence + enjoyment + pressure,
+                                           data = overall_sensitivity_wide,
+                                           cores = future::availableCores())
+
+sensitivity_group2subscale2response <- compute_indirect(sensitivity_mediation_full_model)
+plot_indirect(sensitivity_group2subscale2response)
+```
+
+```{r}
+overall_RT <- 
+  results %>%
+  group_by(Observer, Condition, d_nonGamer) %>%
+  summarise(MedianRT = median(RT)) %>%
+  ungroup()  %>%
+  left_join(overall_IM, by=c("Condition", "Observer", "d_nonGamer"))
+
+
+overall_RT_wide <-
+  overall_RT %>%
+  tidyr::pivot_wider(names_from = "subscale", values_from = "AvgResponse")
+
+RT_mediation_full_model <- brms::brm(MedianRT ~ Condition + d_nonGamer + choice + competence + enjoyment + pressure,
+                                           data = overall_RT_wide,
+                                           cores = future::availableCores())
+
+RT_group2subscale2response <- compute_indirect(RT_mediation_full_model)
+plot_indirect(RT_group2subscale2response)
+```
+
+
+```{r}
+overall_score <-
+  results %>%
+  group_by(Observer, Condition, d_nonGamer) %>%
+  summarise(TotalScore= sum(score)/1000) %>%
+  ungroup()  %>%
+  left_join(overall_IM, by=c("Condition", "Observer", "d_nonGamer"))
+
+
+overall_score_wide <-
+  overall_score %>%
+  tidyr::pivot_wider(names_from = "subscale", values_from = "AvgResponse")
+
+score_mediation_full_model <- brms::brm(TotalScore ~ Condition + d_nonGamer + choice + competence + enjoyment + pressure,
+                                           data = overall_score_wide,
+                                           cores = future::availableCores())
+
+score_group2subscale2response <- compute_indirect(score_mediation_full_model)
+plot_indirect(score_group2subscale2response)
+```
+
+```{r indirect effect summary}
+all_group2subscale2response <-
+  bind_rows(accuracy_group2subscale2response %>% mutate(Measure = "Accuracy"),
+            sensitivity_group2subscale2response %>% mutate(Measure = "Sensitivity"),
+            RT_group2subscale2response %>% mutate(Measure = "RT"),
+            score_group2subscale2response %>% mutate(Measure = "Score"))
+
+
+all_group2subscale2response %>%
+  group_by(Measure, subscale) %>%
+  summarise(Median = median(Indirect),
+            LowerCI = quantile(Indirect, 0.025),
+            UpperCI = quantile(Indirect, 0.975)) %>%
+  mutate_if(is.numeric, round, digits=2) %>%
+  mutate(Info = glue::glue("{LowerCI}|{Median}|{UpperCI}")) %>%
+  select(-Median, -LowerCI,, -UpperCI) %>%
+  tidyr::pivot_wider(names_from = subscale, values_from = Info) 
+  
+  
+
+```
